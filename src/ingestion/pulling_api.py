@@ -1,23 +1,20 @@
 from __future__ import annotations
 
-from IPython.display import display
 from pathlib import Path
-from typing import Any
+import io
 import logging
-import time
 
 import pandas as pd
 import requests
 
 
 # ---------------------------
-# SIMPLE LOGGING (SET ONCE)
+# LOGGING
 # ---------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
+    format="%(asctime)s - %(levelname)s - %(message)s",
 )
-
 logger = logging.getLogger(__name__)
 
 
@@ -26,177 +23,74 @@ logger = logging.getLogger(__name__)
 # ---------------------------
 BASE_URL = "https://www.fema.gov/api/open"
 
-ENDPOINTS = {
-    "declarations": f"{BASE_URL}/v2/DisasterDeclarationsSummaries",
-    "public_assistance": f"{BASE_URL}/v2/PublicAssistanceFundedProjectsDetails",
-    "disaster_summaries": f"{BASE_URL}/v1/FemaWebDisasterSummaries",
+# Bulk CSV URLs — one request downloads the full dataset, no pagination needed
+BULK_ENDPOINTS = {
+    "declarations":       f"{BASE_URL}/v2/DisasterDeclarationsSummaries.csv",
+    "public_assistance":  f"{BASE_URL}/v2/PublicAssistanceFundedProjectsDetails.csv",
+    "disaster_summaries": f"{BASE_URL}/v1/FemaWebDisasterSummaries.csv",
 }
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RAW_DIR = PROJECT_ROOT / "data" / "raw"
-CHECKPOINT_DIR = PROJECT_ROOT / "data" / "raw" / "_checkpoints"
+
 REQUEST_HEADERS = {
-    "Accept": "application/json",
     "User-Agent": "DisasterRecoveryCostPrediction/1.0",
 }
 
 
 # ---------------------------
-# HELPERS
+# BULK DOWNLOAD
 # ---------------------------
-def _extract_records(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    for key, value in payload.items():
-        if key not in {"metadata", "count"} and isinstance(value, list):
-            return value
-    return []
-
-
-def _safe_request(url: str, params: dict, retries: int = 8, timeout: int = 120):
-    last_error: requests.RequestException | None = None
-
-    for attempt in range(retries):
-        try:
-            response = requests.get(
-                url,
-                params=params,
-                timeout=timeout,
-                headers=REQUEST_HEADERS,
-            )
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.HTTPError as e:
-            last_error = e
-            status = e.response.status_code if e.response is not None else 0
-            # On 503/429 honour Retry-After header if present, else back off hard
-            if status in (429, 503):
-                retry_after = int(e.response.headers.get("Retry-After", 0)) if e.response is not None else 0
-                wait = max(retry_after, min(30 * (2 ** attempt), 300))
+def download_bulk_csv(name: str, url: str) -> pd.DataFrame:
+    """Stream the full FEMA bulk CSV in one request — no pagination, no rate limits."""
+    logger.info("Downloading %s from %s", name, url)
+    with requests.get(url, headers=REQUEST_HEADERS, stream=True, timeout=600) as resp:
+        resp.raise_for_status()
+        total = int(resp.headers.get("Content-Length", 0))
+        chunks: list[bytes] = []
+        downloaded = 0
+        for chunk in resp.iter_content(chunk_size=512 * 1024):  # 512 KB chunks
+            chunks.append(chunk)
+            downloaded += len(chunk)
+            if total:
+                logger.info("%s: %.1f%% (%s MB / %s MB)",
+                            name, downloaded / total * 100,
+                            downloaded // 1_048_576, total // 1_048_576)
             else:
-                wait = min(5 * (2 ** attempt), 120)
-            logger.warning(
-                "Attempt %s/%s failed (HTTP %s) for %s ($skip=%s) — retrying in %ss",
-                attempt + 1, retries, status,
-                url, params.get("$skip", 0), wait,
-            )
-            time.sleep(wait)
-        except requests.RequestException as e:
-            last_error = e
-            wait = min(5 * (2 ** attempt), 120)
-            logger.warning(
-                "Attempt %s/%s failed for %s ($skip=%s): %s — retrying in %ss",
-                attempt + 1, retries, url, params.get("$skip", 0), e, wait,
-            )
-            time.sleep(wait)
+                logger.info("%s: %.1f MB downloaded", name, downloaded / 1_048_576)
 
-    raise RuntimeError(
-        f"Request failed for {url} with params {params}: {last_error}"
-    ) from last_error
+    df = pd.read_csv(io.BytesIO(b"".join(chunks)), low_memory=False)
+    logger.info("Loaded %s rows, %s columns for %s", len(df), len(df.columns), name)
+    return df
 
 
 # ---------------------------
-# CHECKPOINT HELPERS
+# SAVE
 # ---------------------------
-def _checkpoint_path(name: str) -> Path:
-    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-    return CHECKPOINT_DIR / f"{name}.parquet"
-
-
-def _load_checkpoint(name: str) -> tuple[pd.DataFrame, int]:
-    """Return (records_so_far_df, next_skip). Returns empty df and 0 if none."""
-    path = _checkpoint_path(name)
-    if path.exists():
-        df = pd.read_parquet(path)
-        skip = len(df)
-        logger.info("Resuming %s from checkpoint at skip=%s (%s rows)", name, skip, len(df))
-        return df, skip
-    return pd.DataFrame(), 0
-
-
-def _save_checkpoint(name: str, df: pd.DataFrame) -> None:
-    _checkpoint_path(name).write_bytes(
-        df.to_parquet(index=False)
-    )
-
-
-def _clear_checkpoint(name: str) -> None:
-    path = _checkpoint_path(name)
-    if path.exists():
-        path.unlink()
-
-
-# ---------------------------
-# DATA FETCHING
-# ---------------------------
-def fetch_paginated_data(
-    endpoint_url: str,
-    name: str = "unnamed",
-    fields: list[str] | None = None,
-    max_records: int | None = None,
-    page_size: int = 250,
-) -> pd.DataFrame:
-
-    params = {"$format": "json", "$top": page_size}
-    if fields:
-        params["$select"] = ",".join(fields)
-
-    existing_df, skip = _load_checkpoint(name)
-    records = existing_df.to_dict("records") if not existing_df.empty else []
-
-    while True:
-        time.sleep(5)  # conservative inter-page delay
-
-        payload = _safe_request(endpoint_url, {**params, "$skip": skip})
-        batch = _extract_records(payload)
-
-        if not batch:
-            break
-
-        records.extend(batch)
-        skip += page_size
-        logger.info("Fetched %s records total for %s", len(records), name)
-
-        # Save checkpoint after every page so a 503 mid-run loses nothing
-        _save_checkpoint(name, pd.DataFrame(records))
-
-        if max_records and len(records) >= max_records:
-            records = records[:max_records]
-            break
-
-    _clear_checkpoint(name)
-    return pd.DataFrame(records)
-
-
-# ---------------------------
-# SAVE FUNCTION
-# ---------------------------
-def save_dataframe(df: pd.DataFrame, filename: str):
+def save_dataframe(df: pd.DataFrame, filename: str) -> None:
     RAW_DIR.mkdir(parents=True, exist_ok=True)
     path = RAW_DIR / f"{filename}.csv"
     df.to_csv(path, index=False)
-    logger.info(f"Saved {len(df)} rows → {path}")
+    logger.info("Saved %s rows → %s", len(df), path)
 
 
 # ---------------------------
 # FULL INGESTION
 # ---------------------------
-def run_ingestion():
+def run_ingestion() -> None:
     logger.info("Starting full data ingestion")
     failures = []
 
-    for name, url in ENDPOINTS.items():
-        logger.info(f"Fetching {name}")
-
+    for name, url in BULK_ENDPOINTS.items():
         try:
-            df = fetch_paginated_data(url, name=name)
+            df = download_bulk_csv(name, url)
             save_dataframe(df, name)
-        except RuntimeError as exc:
+        except Exception as exc:
             logger.error("Failed to fetch %s: %s", name, exc)
             failures.append(name)
 
     if failures:
-        raise RuntimeError(
-            f"Data ingestion completed with failures for: {', '.join(failures)}"
-        )
+        raise RuntimeError(f"Ingestion failed for: {', '.join(failures)}")
 
     logger.info("Data ingestion complete")
 
@@ -204,10 +98,8 @@ def run_ingestion():
 # ===========================
 # CONTROL PANEL
 # ===========================
-MODE = "fetch_all"   # "list_columns", "fetch", "fetch_all"
+MODE = "fetch_all"   # "fetch_all" | "fetch"
 ENDPOINT_NAME = "public_assistance"
-FIELDS = None
-MAX_RECORDS = None
 
 
 # ===========================
@@ -217,19 +109,11 @@ if MODE == "fetch_all":
     run_ingestion()
 
 elif MODE == "fetch":
-    start = time.time()
-
-    df = fetch_paginated_data(
-        ENDPOINTS[ENDPOINT_NAME],
-        name=ENDPOINT_NAME,
-        fields=FIELDS,
-        max_records=MAX_RECORDS,
-    )
-
-    display(df.head())
+    if ENDPOINT_NAME not in BULK_ENDPOINTS:
+        raise ValueError(f"Unknown endpoint '{ENDPOINT_NAME}'. Choose from: {list(BULK_ENDPOINTS)}")
+    df = download_bulk_csv(ENDPOINT_NAME, BULK_ENDPOINTS[ENDPOINT_NAME])
+    print(df.head())
     save_dataframe(df, ENDPOINT_NAME)
 
-    logger.info(f"Completed in {time.time() - start:.2f} seconds")
-
 else:
-    print("Invalid MODE")
+    print("Invalid MODE. Use 'fetch_all' or 'fetch'.")
