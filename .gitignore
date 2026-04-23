@@ -1,1 +1,6 @@
 .venv
+
+# Raw data — too large for GitHub
+data/raw/*.csv
+data/raw/_checkpoints/
+*.csv
